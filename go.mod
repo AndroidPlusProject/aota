@@ -1,4 +1,4 @@
-module github.com/tobyxdd/android-ota-payload-extractor
+module github.com/JoshuaDoes/android-ota-payload-extractor
 
 go 1.13
 
