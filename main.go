@@ -208,7 +208,7 @@ func extractPartition(p *PartitionUpdate, outFilename string, r io.ReadSeeker, b
 	}
 	var writeLock sync.Mutex
 	activeOps := len(p.Operations)
-	for i, op := range p.Operations {
+	for _, op := range p.Operations {
 		dataLength := *op.DataLength
 		if dataLen >= dataCap {
 			for {
