@@ -183,7 +183,11 @@ func extractPartitions(blockSize uint32, partitions []*PartitionUpdate, r io.Rea
 			lock.Unlock()
 		}
 		go func(p *PartitionUpdate, r io.ReadSeeker, baseOffset uint64, blockSize uint32) {
-			log.Printf("Extracting %s (%d ops) ...", *p.PartitionName, len(p.Operations))
+			size := uint64(0)
+			for i := 0; i < len(p.Operations); i++ {
+				size += *p.Operations[i].DataLength
+			}
+			log.Printf("Extracting %s (%d ops = %d bytes) ...", *p.PartitionName, len(p.Operations), size)
 			outFilename := fmt.Sprintf("%s.img", *p.PartitionName)
 			_ = os.Remove(outFilename)
 			extractPartition(p, outFilename, r, baseOffset, blockSize)
@@ -202,9 +206,10 @@ func extractPartition(p *PartitionUpdate, outFilename string, r io.ReadSeeker, b
 	if err != nil {
 		log.Fatalf("Failed to create the output file: %s\n", err.Error())
 	}
+	var writeLock sync.Mutex
 	activeOps := len(p.Operations)
-	for i := 0; i < len(p.Operations); i++ {
-		dataLength := *p.Operations[i].DataLength
+	for i, op := range p.Operations {
+		dataLength := *op.DataLength
 		if dataLen >= dataCap {
 			for {
 				time.Sleep(time.Millisecond * 100)
@@ -218,30 +223,31 @@ func extractPartition(p *PartitionUpdate, outFilename string, r io.ReadSeeker, b
 			lock.Lock()
 		}
 		dataLen += dataLength
-		//log.Printf("- %s (%d/%d ops - %d bytes - total %d/%d bytes)", *p.PartitionName, i, len(p.Operations), dataLength, dataLen, dataCap)
-		go func(op *InstallOperation) {
-			dataPos := int64(baseOffset + *op.DataOffset)
+		log.Printf("- %s (%d/%d ops - %d bytes - total %d/%d bytes)", *p.PartitionName, i+1, len(p.Operations), dataLength, dataLen, dataCap)
+		go func(instop *InstallOperation) {
+			dataPos := int64(baseOffset + *instop.DataOffset)
 			_, err = r.Seek(dataPos, 0)
 			if err != nil {
 				_ = outFile.Close()
 				log.Fatalf("Failed to seek to %d in partition %s: %s\n", dataPos, outFilename, err.Error())
 			}
-			data := make([]byte, *op.DataLength)
+			data := make([]byte, *instop.DataLength)
 			n, err := r.Read(data)
-			if err != nil || uint64(n) != *op.DataLength {
+			if err != nil || uint64(n) != *instop.DataLength {
 				_ = outFile.Close()
 				log.Fatalf("Failed to read enough data from partition %s: %s\n", outFilename, err.Error())
 			}
 			lock.Unlock()
 
-			outSeekPos := int64(*op.DstExtents[0].StartBlock * uint64(blockSize))
+			writeLock.Lock()
+			outSeekPos := int64(*instop.DstExtents[0].StartBlock * uint64(blockSize))
 			_, err = outFile.Seek(outSeekPos, 0)
 			if err != nil {
 				_ = outFile.Close()
 				log.Fatalf("Failed to seek to %d in partition %s: %s\n", outSeekPos, outFilename, err.Error())
 			}
 
-			switch *op.Type {
+			switch *instop.Type {
 			case InstallOperation_REPLACE:
 				_, err = outFile.Write(data)
 				if err != nil {
@@ -267,7 +273,7 @@ func extractPartition(p *PartitionUpdate, outFilename string, r io.ReadSeeker, b
 					log.Fatalf("Failed to write output to %s: %s\n", outFilename, err.Error())
 				}
 			case InstallOperation_ZERO:
-				for _, ext := range op.DstExtents {
+				for _, ext := range instop.DstExtents {
 					outSeekPos = int64(*ext.StartBlock * uint64(blockSize))
 					_, err = outFile.Seek(outSeekPos, 0)
 					if err != nil {
@@ -284,18 +290,20 @@ func extractPartition(p *PartitionUpdate, outFilename string, r io.ReadSeeker, b
 			default:
 				_ = outFile.Close()
 				log.Fatalf("Unsupported operation type: %d (%s), please report a bug\n",
-					*op.Type, InstallOperation_Type_name[int32(*op.Type)])
+					*instop.Type, InstallOperation_Type_name[int32(*instop.Type)])
 			}
+			writeLock.Unlock()
 
 			lock.Lock()
 			activeOps--
-			dataLen -= *op.DataLength
+			dataLen -= *instop.DataLength
 			lock.Unlock()
-		}(p.Operations[i])
+		}(op)
 	}
 	for activeOps > 0 {
 		time.Sleep(time.Millisecond * 100) //Wait patiently!
 	}
+	_ = outFile.Close()
 }
 
 func contains(ss []string, s string) bool {
