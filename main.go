@@ -187,7 +187,7 @@ func extractPartitions(blockSize uint32, partitions []*PartitionUpdate, r io.Rea
 			for i := 0; i < len(p.Operations); i++ {
 				size += *p.Operations[i].DataLength
 			}
-			log.Printf("Extracting %s (%d ops = %d bytes) ...", *p.PartitionName, len(p.Operations), size)
+			log.Printf("Extracting %s (%d ops = %d bytes to write) ...", *p.PartitionName, len(p.Operations), size)
 			outFilename := fmt.Sprintf("%s.img", *p.PartitionName)
 			_ = os.Remove(outFilename)
 			extractPartition(p, outFilename, r, baseOffset, blockSize)
@@ -223,7 +223,7 @@ func extractPartition(p *PartitionUpdate, outFilename string, r io.ReadSeeker, b
 			lock.Lock()
 		}
 		dataLen += dataLength
-		log.Printf("- %s (%d/%d ops - %d bytes - total %d/%d bytes)", *p.PartitionName, i+1, len(p.Operations), dataLength, dataLen, dataCap)
+		//log.Printf("- %s (%d/%d ops - %d bytes - total %d/%d bytes)", *p.PartitionName, i+1, len(p.Operations), dataLength, dataLen, dataCap)
 		go func(instop *InstallOperation) {
 			dataPos := int64(baseOffset + *instop.DataOffset)
 			_, err = r.Seek(dataPos, 0)
