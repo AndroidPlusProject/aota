@@ -93,7 +93,8 @@ func main() {
 	if dataCap > 4096000 {
 		dataCap -= 4096000 //Potential to overflow <= 4MB
 	}
-	extractPartitions(blockSize, partitions, f, baseOffset, extractFiles)
+	iops := NewInstallOps(f, blockSize, baseOffset, partitions, extractFiles)
+	iops.Run()
 
 	log.Println("Done!")
 	deltaTime := time.Now().Sub(startTime)
@@ -107,7 +108,7 @@ func main() {
 	log.Printf("Operation took %d minute(s) and %d second(s)", minutes, seconds)
 }
 
-func parsePayload(r io.ReadSeeker) (uint32, []*PartitionUpdate, uint64, error) {
+func parsePayload(r io.ReadSeeker) (uint64, []*PartitionUpdate, uint64, error) {
 	log.Println("Parsing payload...")
 	// magic
 	magic := make([]byte, len(payloadMagic))
@@ -149,7 +150,7 @@ func parsePayload(r io.ReadSeeker) (uint32, []*PartitionUpdate, uint64, error) {
 	log.Printf("Block size: %d, Partition count: %d\n",
 		*manifest.BlockSize, len(manifest.Partitions))
 	// extract partitions
-	blockSize := *manifest.BlockSize
+	blockSize := uint64(*manifest.BlockSize)
 	partitions := make([]*PartitionUpdate, len(manifest.Partitions))
 	for i := 0; i < len(partitions); i++ {
 		partition := *manifest.Partitions[i]
@@ -159,149 +160,209 @@ func parsePayload(r io.ReadSeeker) (uint32, []*PartitionUpdate, uint64, error) {
 	return blockSize, partitions, 24 + manifestLen + uint64(metadataSigLen), nil
 }
 
-func extractPartitions(blockSize uint32, partitions []*PartitionUpdate, r io.ReadSeeker, baseOffset uint64, extractFiles []string) {
-	for _, p := range partitions {
-		if p.PartitionName == nil || (len(extractFiles) > 0 && !contains(extractFiles, *p.PartitionName)) {
+type InstallOpsPartition struct {
+	sync.Mutex //Locks writes to extracted file
+
+	Name string
+	Ops  int
+	Size uint64
+	File *os.File
+}
+
+type InstallOps struct {
+	sync.Mutex //Locks payload reading and seeking
+
+	Map []*InstallOpsPartition
+	Ops []*InstallOperation
+	Active int
+
+	Payload    io.ReadSeeker
+	BlockSize  uint64
+	BaseOffset uint64
+}
+
+func NewInstallOps(payload io.ReadSeeker, blockSize, baseOffset uint64, partitions []*PartitionUpdate, extract []string) *InstallOps {
+	iops := &InstallOps{
+		Map: make([]*InstallOpsPartition, 0),
+		Ops: make([]*InstallOperation, 0),
+		Payload: payload,
+		BlockSize: blockSize,
+		BaseOffset: baseOffset,
+	}
+
+	for i := 0; i < len(partitions); i++ {
+		p := partitions[i]
+		if p.PartitionName == nil {
 			continue
 		}
-		if activeFiles >= runtime.NumCPU() {
-			for {
-				time.Sleep(time.Millisecond * 100)
-				lock.Lock()
-				if activeFiles < runtime.NumCPU() {
-					activeFiles++
-					lock.Unlock()
-					break
-				}
-				lock.Unlock()
+		if extract != nil && len(extract) > 0 {
+			if !contains(extract, *p.PartitionName) {
+				continue
 			}
-		} else {
-			lock.Lock()
-			activeFiles++
-			lock.Unlock()
 		}
-		go func(p *PartitionUpdate, r io.ReadSeeker, baseOffset uint64, blockSize uint32) {
-			size := uint64(0)
-			for i := 0; i < len(p.Operations); i++ {
-				size += *p.Operations[i].DataLength
-			}
-			log.Printf("Extracting %s (%d ops = %d bytes to write) ...", *p.PartitionName, len(p.Operations), size)
-			outFilename := fmt.Sprintf("%s.img", *p.PartitionName)
-			_ = os.Remove(outFilename)
-			extractPartition(p, outFilename, r, baseOffset, blockSize)
-			lock.Lock()
-			activeFiles--
-			lock.Unlock()
-		}(p, r, baseOffset, blockSize)
+
+		iop := &InstallOpsPartition{
+			Name: *p.PartitionName,
+			Ops: len(p.Operations),
+		}
+		for j := 0; j < len(p.Operations); j++ {
+			iop.Size += *p.Operations[j].DataLength
+		}
+
+		out := fmt.Sprintf("%s.img", iop.Name)
+		_ = os.Remove(out)
+		file, err := os.Create(out)
+		if err != nil {
+			log.Fatalf("Failed to create %s: %v", out, err)
+		}
+		iop.File = file
+
+		iops.Map = append(iops.Map, iop)
+		iops.Ops = append(iops.Ops, p.Operations...)
 	}
-	for activeFiles > 0 {
-		time.Sleep(time.Millisecond * 100) //Wait patiently!
+
+	return iops
+}
+
+func (iops *InstallOps) Run() {
+	if len(iops.Map) == 0 || len(iops.Ops) == 0 {
+		return
+	}
+
+	threads := runtime.NumCPU()
+	iops.Active = threads
+	ops := int(math.Ceil(float64(len(iops.Ops)) / float64(threads)))
+
+	for i := 0; i < threads; i++ {
+		go iops.runThread(i*ops, ops)
+	}
+
+	for iops.Active > 0 {
+		time.Sleep(time.Millisecond * 100)
 	}
 }
 
-func extractPartition(p *PartitionUpdate, outFilename string, r io.ReadSeeker, baseOffset uint64, blockSize uint32) {
-	outFile, err := os.Create(outFilename)
-	if err != nil {
-		log.Fatalf("Failed to create the output file: %s\n", err.Error())
+func (iops *InstallOps) runThread(index, ops int) {
+	if index >= len(iops.Ops) {
+		return
 	}
-	var writeLock sync.Mutex
-	activeOps := len(p.Operations)
-	for _, op := range p.Operations {
-		dataLength := *op.DataLength
-		if dataLen >= dataCap {
-			for {
-				time.Sleep(time.Millisecond * 100)
-				lock.Lock()
-				if dataLen < dataCap {
-					break
-				}
-				lock.Unlock()
-			}
-		} else {
-			lock.Lock()
+	if (index+ops) >= len(iops.Ops) {
+		ops = len(iops.Ops)-index
+	}
+
+	for i := index; i < (index+ops); i++ {
+		iops.writeOp(i)
+	}
+
+	iops.Lock()
+	iops.Active--
+	iops.Unlock()
+}
+
+func (iops *InstallOps) getPart(op int) *InstallOpsPartition {
+	if len(iops.Map) == 0 || len(iops.Ops) == 0 || op >= len(iops.Ops) {
+		return nil
+	}
+
+	index := 0
+	for i := 0; i < len(iops.Map); i++ {
+		if op < (index + iops.Map[i].Ops) {
+			return iops.Map[i]
 		}
-		dataLen += dataLength
-		//log.Printf("- %s (%d/%d ops - %d bytes - total %d/%d bytes)", *p.PartitionName, i+1, len(p.Operations), dataLength, dataLen, dataCap)
-		go func(instop *InstallOperation) {
-			dataPos := int64(baseOffset + *instop.DataOffset)
-			_, err = r.Seek(dataPos, 0)
-			if err != nil {
-				_ = outFile.Close()
-				log.Fatalf("Failed to seek to %d in reader for partition %s: %s\n", dataPos, outFilename, err.Error())
-			}
-			data := make([]byte, *instop.DataLength)
-			n, err := r.Read(data)
-			if err != nil || uint64(n) != *instop.DataLength {
-				_ = outFile.Close()
-				log.Fatalf("Failed to read enough data from partition %s: %s\n", outFilename, err.Error())
-			}
-			lock.Unlock()
-
-			writeLock.Lock()
-			outSeekPos := int64(*instop.DstExtents[0].StartBlock * uint64(blockSize))
-			_, err = outFile.Seek(outSeekPos, 0)
-			if err != nil {
-				_ = outFile.Close()
-				log.Fatalf("Failed to seek to %d in output for partition %s: %s\n", outSeekPos, outFilename, err.Error())
-			}
-
-			switch *instop.Type {
-			case InstallOperation_REPLACE:
-				_, err = outFile.Write(data)
-				if err != nil {
-					_ = outFile.Close()
-					log.Fatalf("Failed to write output to %s: %s\n", outFilename, err.Error())
-				}
-			case InstallOperation_REPLACE_BZ:
-				bzr := bzip2.NewReader(bytes.NewReader(data))
-				_, err = io.Copy(outFile, bzr)
-				if err != nil {
-					_ = outFile.Close()
-					log.Fatalf("Failed to write output to %s: %s\n", outFilename, err.Error())
-				}
-			case InstallOperation_REPLACE_XZ:
-				xzr, err := xz.NewReader(bytes.NewReader(data), 0)
-				if err != nil {
-					_ = outFile.Close()
-					log.Fatalf("Bad xz data in partition %s: %s\n", *p.PartitionName, err.Error())
-				}
-				_, err = io.Copy(outFile, xzr)
-				if err != nil {
-					_ = outFile.Close()
-					log.Fatalf("Failed to write output to %s: %s\n", outFilename, err.Error())
-				}
-			case InstallOperation_ZERO:
-				for _, ext := range instop.DstExtents {
-					outSeekPos = int64(*ext.StartBlock * uint64(blockSize))
-					_, err = outFile.Seek(outSeekPos, 0)
-					if err != nil {
-						_ = outFile.Close()
-						log.Fatalf("Failed to seek to %d in output for partition %s: %s\n", outSeekPos, outFilename, err.Error())
-					}
-					// write zeros
-					_, err = io.Copy(outFile, bytes.NewReader(make([]byte, *ext.NumBlocks*uint64(blockSize))))
-					if err != nil {
-						_ = outFile.Close()
-						log.Fatalf("Failed to write output to %s: %s\n", outFilename, err.Error())
-					}
-				}
-			default:
-				_ = outFile.Close()
-				log.Fatalf("Unsupported operation type: %d (%s), please report a bug\n",
-					*instop.Type, InstallOperation_Type_name[int32(*instop.Type)])
-			}
-			writeLock.Unlock()
-
-			lock.Lock()
-			activeOps--
-			dataLen -= *instop.DataLength
-			lock.Unlock()
-		}(op)
+		index += iops.Map[i].Ops
 	}
-	for activeOps > 0 {
-		time.Sleep(time.Millisecond * 100) //Wait patiently!
+
+	return nil
+}
+
+func (iops *InstallOps) writeOp(op int) {
+	part := iops.getPart(op)
+	if part == nil {
+		log.Fatalf("Nil part when attempting to write op %d", op)
 	}
-	_ = outFile.Close()
+	ioop := iops.Ops[op]
+	seek := int64(iops.BaseOffset + *ioop.DataOffset)
+	dataLength := *ioop.DataLength
+
+	//Reserve enough free memory
+	if dataLen >= dataCap {
+		for {
+			time.Sleep(time.Millisecond * 100)
+			iops.Lock()
+			if dataLen < dataCap || dataLen == 0 {
+				break
+			}
+			iops.Unlock()
+		}
+	} else {
+		iops.Lock()
+	}
+	dataLen += dataLength
+
+	//Read the bytes for the operation
+	_, err := iops.Payload.Seek(seek, 0)
+	if err != nil {
+		log.Fatalf("Op %d failed to seek to %d: %v", op, seek, err)
+	}
+	data := make([]byte, dataLength)
+	n, err := iops.Payload.Read(data)
+	if err != nil {
+		log.Fatalf("Op %d failed to read %d bytes: %v", op, dataLength, err)
+	}
+	if uint64(n) != dataLength {
+		log.Fatalf("Op %d expected %d bytes, got %d bytes", op, dataLength, n)
+	}
+	iops.Unlock()
+
+	//Write the bytes for the operation
+	part.Lock()
+	partSeek := int64(*ioop.DstExtents[0].StartBlock * iops.BlockSize)
+	_, err = part.File.Seek(partSeek, 0)
+	if err != nil {
+		log.Fatalf("Failed to seek to %d in output for %s op %d: %v", partSeek, part.Name, op, err)
+	}
+
+	switch *ioop.Type {
+	case InstallOperation_REPLACE:
+		_, err = part.File.Write(data)
+		if err != nil {
+			log.Fatalf("Failed to write output for %s op %d: %v", part.Name, op, err)
+		}
+	case InstallOperation_REPLACE_BZ:
+		bzr := bzip2.NewReader(bytes.NewReader(data))
+		_, err = io.Copy(part.File, bzr)
+		if err != nil {
+			log.Fatalf("Failed to write bzip2 output for %s op %d: %v", part.Name, op, err)
+		}
+	case InstallOperation_REPLACE_XZ:
+		xzr, err := xz.NewReader(bytes.NewReader(data), 0)
+		if err != nil {
+			log.Fatalf("Bad xz data in %s: %v", part.Name, err)
+		}
+		_, err = io.Copy(part.File, xzr)
+		if err != nil {
+			log.Fatalf("Failed to write xz output for %s op %d: %v", part.Name, op, err)
+		}
+	case InstallOperation_ZERO:
+		for _, ext := range ioop.DstExtents {
+			partSeek = int64(*ext.StartBlock * iops.BlockSize)
+			_, err = part.File.Seek(partSeek, 0)
+			if err != nil {
+				log.Fatalf("Failed to seek to %d in output for %s op %d: %v", partSeek, part.Name, op, err)
+			}
+			_, err = io.Copy(part.File, bytes.NewReader(make([]byte, *ext.NumBlocks*iops.BlockSize)))
+			if err != nil {
+				log.Fatalf("Failed to write zero output for %s op %d: %v", part.Name, op, err)
+			}
+		}
+	default:
+		log.Fatalf("Unsupported operation type %d (%s), please report a bug!", *ioop.Type, InstallOperation_Type_name[int32(*ioop.Type)])
+	}
+	part.Unlock()
+
+	iops.Lock()
+	dataLen -= *ioop.DataLength
+	iops.Unlock()
 }
 
 func contains(ss []string, s string) bool {
