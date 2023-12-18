@@ -5,11 +5,10 @@ import (
 	"bytes"
 	"compress/bzip2"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"math"
+	"math/rand"
 	"os"
 	"runtime"
 	"sync"
@@ -17,23 +16,20 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/mholt/archiver/v4"
+	crunch "github.com/superwhiskers/crunch/v3"
 	"github.com/xi2/xz"
 )
 
 const (
 	payloadFilename = "payload.bin"
-
-	zipMagic     = "PK"
 	payloadMagic = "CrAU"
-
 	brilloMajorPayloadVersion = 2
 )
 
 var (
-	activeFiles = 0
-	dataLen     = uint64(0)
-	dataCap     = uint64(0)
-	lock        sync.Mutex
+	dataLen  = uint64(0)
+	dataCap  = uint64(0)
+	dataLock sync.Mutex
 )
 
 func main() {
@@ -43,7 +39,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	var f io.ReadSeeker
+	dataCap = uint64(runtime.NumCPU() * 4096000)
+	fmt.Printf("Up to %dMiB of memory may be used to buffer operations on all cores\n", (runtime.NumCPU() * 4))
+
+	var buf *crunch.Buffer
 	filename := os.Args[1]
 	extractFiles := os.Args[2:]
 
@@ -52,51 +51,53 @@ func main() {
 		zr.Close()
 		fsys, err := archiver.FileSystem(context.Background(), filename)
 		if err != nil {
-			log.Printf("Error opening archive: %v", err)
+			fmt.Printf("Error opening archive: %v\n", err)
 			os.Exit(1)
 		} else {
-			log.Printf("Input is an archive, reading %s into memory...", payloadFilename)
+			fmt.Printf("Input is an archive, reading %s into memory...\n", payloadFilename)
 			bin, err := fsys.Open(payloadFilename)
 			if err != nil {
-				log.Printf("Error opening payload from archive: %v", err)
+				fmt.Printf("Error opening payload from archive: %v\n", err)
 				os.Exit(1)
 			}
 			data, err := io.ReadAll(bin)
 			if err != nil {
-				log.Printf("Error reading payload from archive: %v", err)
+				fmt.Printf("Error reading payload from archive: %v\n", err)
 				os.Exit(1)
 			}
-			f = bytes.NewReader(data)
+			buf = crunch.NewBuffer(data)
 		}
 	} else {
-		log.Printf("Reading %s into memory...", filename)
+		fmt.Printf("Reading %s into memory...\n", filename)
 		bin, err := os.Open(filename)
 		if err != nil {
-			log.Printf("Error opening payload: %v", err)
+			fmt.Printf("Error opening payload: %v\n", err)
 			os.Exit(1)
 		}
 		data, err := io.ReadAll(bin)
 		if err != nil {
-			log.Printf("Error reading payload: %v", err)
+			fmt.Printf("Error reading payload: %v\n", err)
 			os.Exit(1)
 		}
-		f = bytes.NewReader(data)
+		buf = crunch.NewBuffer(data)
 	}
 
-	blockSize, partitions, baseOffset, err := parsePayload(f)
+	fmt.Println("Parsing payload...")
+	blockSize, partitions, baseOffset, err := parsePayload(buf)
 	if err != nil {
-		log.Printf("Error parsing payload: %v", err)
+		fmt.Printf("Error parsing payload: %v\n", err)
 		os.Exit(1)
 	}
-	dataCap = uint64(runtime.NumCPU() * 4096000)
-	log.Printf("Memory cap set to %d bytes for buffering partition images", dataCap)
-	if dataCap > 4096000 {
-		dataCap -= 4096000 //Potential to overflow <= 4MB
+	fmt.Printf("- %d partitions (offset 0x%X, block size %d)\n", len(partitions), baseOffset, blockSize)
+
+	iops := NewInstallOps(buf, blockSize, baseOffset, partitions, extractFiles)
+	for i := 0; i < len(iops.Map); i++ {
+		iop := iops.Map[i]
+		fmt.Printf("> %s = %d bytes (%d ops)\n", iop.Name, iop.Size, iop.Ops)
 	}
-	iops := NewInstallOps(f, blockSize, baseOffset, partitions, extractFiles)
+	fmt.Printf("= %d install operations remaining\n", len(iops.Ops))
 	iops.Run()
 
-	log.Println("Done!")
 	deltaTime := time.Now().Sub(startTime)
 	minutes := int(math.Floor(deltaTime.Minutes()))
 	seconds := int(math.Floor(deltaTime.Seconds()))
@@ -105,63 +106,62 @@ func main() {
 			seconds -= 60
 		}
 	}
-	log.Printf("Operation took %d minute(s) and %d second(s)", minutes, seconds)
+	pluralM := "minutes"
+	pluralS := "seconds"
+	if minutes == 1 {
+		pluralM = "minute"
+	}
+	if seconds == 1 {
+		pluralS = "second"
+	}
+	fmt.Printf("Operation finished in %d %s and %d %s\n", minutes, pluralM, seconds, pluralS)
 }
 
-func parsePayload(r io.ReadSeeker) (uint64, []*PartitionUpdate, uint64, error) {
-	log.Println("Parsing payload...")
+func parsePayload(buf *crunch.Buffer) (uint64, []*PartitionUpdate, uint64, error) {
 	// magic
-	magic := make([]byte, len(payloadMagic))
-	_, err := r.Read(magic)
-	if err != nil || string(magic) != payloadMagic {
+	magic := buf.ReadBytesNext(int64(len(payloadMagic)))
+	if string(magic) != payloadMagic {
 		return 0, nil, 0, fmt.Errorf("Incorrect magic %s", magic)
 	}
 	// version & lengths
-	var version, manifestLen uint64
-	var metadataSigLen uint32
-	err = binary.Read(r, binary.BigEndian, &version)
-	if err != nil || version != brilloMajorPayloadVersion {
+	version := buf.ReadU64BENext(1)[0]
+	if version != brilloMajorPayloadVersion {
 		return 0, nil, 0, fmt.Errorf("Unsupported payload version %d, requires %d",	version, brilloMajorPayloadVersion)
 	}
-	err = binary.Read(r, binary.BigEndian, &manifestLen)
-	if err != nil || !(manifestLen > 0) {
+	manifestLen := buf.ReadU64BENext(1)[0]
+	if !(manifestLen > 0) {
 		return 0, nil, 0, fmt.Errorf("Incorrect manifest length %d", manifestLen)
 	}
-	err = binary.Read(r, binary.BigEndian, &metadataSigLen)
-	if err != nil || !(metadataSigLen > 0) {
+	metadataSigLen := buf.ReadU32BENext(1)[0]
+	if !(metadataSigLen > 0) {
 		return 0, nil, 0, fmt.Errorf("Incorrect metadata signature length %d", metadataSigLen)
 	}
 	// manifest
-	manifestRaw := make([]byte, manifestLen)
-	n, err := r.Read(manifestRaw)
-	if err != nil || uint64(n) != manifestLen {
+	manifestRaw := buf.ReadBytesNext(int64(manifestLen))
+	if uint64(len(manifestRaw)) != manifestLen {
 		return 0, nil, 0, fmt.Errorf("Failed to read a manifest with %d bytes", manifestLen)
 	}
 	manifest := &DeltaArchiveManifest{}
-	err = proto.Unmarshal(manifestRaw, manifest)
-	if err != nil {
+	if err := proto.Unmarshal(manifestRaw, manifest); err != nil {
 		return 0, nil, 0, err
 	}
 	// only support full payloads!
 	if *manifest.MinorVersion != 0 {
 		return 0, nil, 0, fmt.Errorf("Delta payloads not implemented")
 	}
-	// print manifest info
-	log.Printf("Block size: %d, Partition count: %d\n",
-		*manifest.BlockSize, len(manifest.Partitions))
 	// extract partitions
 	blockSize := uint64(*manifest.BlockSize)
 	partitions := make([]*PartitionUpdate, len(manifest.Partitions))
 	for i := 0; i < len(partitions); i++ {
-		partition := *manifest.Partitions[i]
-		partitions[i] = &partition
+		/*partition := *manifest.Partitions[i]
+		partitions[i] = &partition*/
+		partitions[i] = manifest.Partitions[i]
 	}
-	manifest = nil //Please garbage collect it, please
 	return blockSize, partitions, 24 + manifestLen + uint64(metadataSigLen), nil
 }
 
 type InstallOpsPartition struct {
-	sync.Mutex //Locks writes to extracted file
+	sync.Mutex //Locks writes to the extracted file
 
 	Name string
 	Ops  int
@@ -169,22 +169,30 @@ type InstallOpsPartition struct {
 	File *os.File
 }
 
-type InstallOps struct {
-	sync.Mutex //Locks payload reading and seeking
+type InstallOpsStats struct {
+	sync.Mutex //Locks changes to stats to prevent stat confusion
 
+	Active int //Threads remaining
+	Counter int //Next install op to be worked
+}
+
+type InstallOps struct {
 	Map []*InstallOpsPartition
 	Ops []*InstallOperation
-	Active int
+	Order []int //Shuffled index mapping of ops
+	Stats *InstallOpsStats
 
-	Payload    io.ReadSeeker
+	Payload    *crunch.Buffer
 	BlockSize  uint64
 	BaseOffset uint64
 }
 
-func NewInstallOps(payload io.ReadSeeker, blockSize, baseOffset uint64, partitions []*PartitionUpdate, extract []string) *InstallOps {
+func NewInstallOps(payload *crunch.Buffer, blockSize, baseOffset uint64, partitions []*PartitionUpdate, extract []string) *InstallOps {
 	iops := &InstallOps{
 		Map: make([]*InstallOpsPartition, 0),
 		Ops: make([]*InstallOperation, 0),
+		Order: make([]int, 0),
+		Stats: &InstallOpsStats{},
 		Payload: payload,
 		BlockSize: blockSize,
 		BaseOffset: baseOffset,
@@ -213,13 +221,26 @@ func NewInstallOps(payload io.ReadSeeker, blockSize, baseOffset uint64, partitio
 		_ = os.Remove(out)
 		file, err := os.Create(out)
 		if err != nil {
-			log.Fatalf("Failed to create %s: %v", out, err)
+			fmt.Printf("Failed to create %s: %v\n", out, err)
+			os.Exit(1)
 		}
 		iop.File = file
 
 		iops.Map = append(iops.Map, iop)
 		iops.Ops = append(iops.Ops, p.Operations...)
 	}
+
+	//Shuffle the ordered list so we don't just multithread a single partition
+	for j := 0; j < len(iops.Ops); j++ {
+		if len(iops.Order) > 0 {
+			add := iops.Order[len(iops.Order)-1] + 1
+			iops.Order = append(iops.Order, add)
+		} else {
+			iops.Order = append(iops.Order, 0)
+		}
+	}
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(iops.Order), func(i, j int) {iops.Order[i], iops.Order[j] = iops.Order[j], iops.Order[i]})
 
 	return iops
 }
@@ -228,35 +249,30 @@ func (iops *InstallOps) Run() {
 	if len(iops.Map) == 0 || len(iops.Ops) == 0 {
 		return
 	}
-
 	threads := runtime.NumCPU()
-	iops.Active = threads
-	ops := int(math.Ceil(float64(len(iops.Ops)) / float64(threads)))
-
+	iops.Stats.Active = threads
 	for i := 0; i < threads; i++ {
-		go iops.runThread(i*ops, ops)
+		go iops.runThread()
 	}
-
-	for iops.Active > 0 {
+	for iops.Stats.Active > 0 {
 		time.Sleep(time.Millisecond * 100)
 	}
 }
 
-func (iops *InstallOps) runThread(index, ops int) {
-	if index >= len(iops.Ops) {
-		return
+func (iops *InstallOps) runThread() {
+	for {
+		if iops.Stats.Counter >= len(iops.Ops) {
+			break
+		}
+		iops.Stats.Lock()
+		op := iops.Stats.Counter
+		iops.Stats.Counter++
+		iops.Stats.Unlock()
+		iops.writeOp(op)
 	}
-	if (index+ops) >= len(iops.Ops) {
-		ops = len(iops.Ops)-index
-	}
-
-	for i := index; i < (index+ops); i++ {
-		iops.writeOp(i)
-	}
-
-	iops.Lock()
-	iops.Active--
-	iops.Unlock()
+	iops.Stats.Lock()
+	iops.Stats.Active--
+	iops.Stats.Unlock()
 }
 
 func (iops *InstallOps) getPart(op int) *InstallOpsPartition {
@@ -275,10 +291,12 @@ func (iops *InstallOps) getPart(op int) *InstallOpsPartition {
 	return nil
 }
 
-func (iops *InstallOps) writeOp(op int) {
+func (iops *InstallOps) writeOp(opIndex int) {
+	op := iops.Order[opIndex]
 	part := iops.getPart(op)
 	if part == nil {
-		log.Fatalf("Nil part when attempting to write op %d", op)
+		fmt.Printf("Nil part when attempting to write op %d\n", op)
+		os.Exit(1)
 	}
 	ioop := iops.Ops[op]
 	seek := int64(iops.BaseOffset + *ioop.DataOffset)
@@ -288,81 +306,72 @@ func (iops *InstallOps) writeOp(op int) {
 	if dataLen >= dataCap {
 		for {
 			time.Sleep(time.Millisecond * 100)
-			iops.Lock()
+			dataLock.Lock()
 			if dataLen < dataCap || dataLen == 0 {
 				break
 			}
-			iops.Unlock()
+			dataLock.Unlock()
 		}
 	} else {
-		iops.Lock()
+		dataLock.Lock()
 	}
 	dataLen += dataLength
+	dataLock.Unlock()
 
 	//Read the bytes for the operation
-	_, err := iops.Payload.Seek(seek, 0)
-	if err != nil {
-		log.Fatalf("Op %d failed to seek to %d: %v", op, seek, err)
-	}
-	data := make([]byte, dataLength)
-	n, err := iops.Payload.Read(data)
-	if err != nil {
-		log.Fatalf("Op %d failed to read %d bytes: %v", op, dataLength, err)
-	}
-	if uint64(n) != dataLength {
-		log.Fatalf("Op %d expected %d bytes, got %d bytes", op, dataLength, n)
-	}
-	iops.Unlock()
+	data := iops.Payload.ReadBytes(seek, int64(dataLength))
 
 	//Write the bytes for the operation
 	part.Lock()
 	partSeek := int64(*ioop.DstExtents[0].StartBlock * iops.BlockSize)
-	_, err = part.File.Seek(partSeek, 0)
-	if err != nil {
-		log.Fatalf("Failed to seek to %d in output for %s op %d: %v", partSeek, part.Name, op, err)
+	if _, err := part.File.Seek(partSeek, 0); err != nil {
+		fmt.Printf("Failed to seek to %d in output for %s op %d: %v\n", partSeek, part.Name, op, err)
+		os.Exit(1)
 	}
 
 	switch *ioop.Type {
 	case InstallOperation_REPLACE:
-		_, err = part.File.Write(data)
-		if err != nil {
-			log.Fatalf("Failed to write output for %s op %d: %v", part.Name, op, err)
+		if _, err := part.File.Write(data); err != nil {
+			fmt.Printf("Failed to write output for %s op %d: %v\n", part.Name, op, err)
+			os.Exit(1)
 		}
 	case InstallOperation_REPLACE_BZ:
 		bzr := bzip2.NewReader(bytes.NewReader(data))
-		_, err = io.Copy(part.File, bzr)
-		if err != nil {
-			log.Fatalf("Failed to write bzip2 output for %s op %d: %v", part.Name, op, err)
+		if _, err := io.Copy(part.File, bzr); err != nil {
+			fmt.Printf("Failed to write bzip2 output for %s op %d: %v\n", part.Name, op, err)
+			os.Exit(1)
 		}
 	case InstallOperation_REPLACE_XZ:
 		xzr, err := xz.NewReader(bytes.NewReader(data), 0)
 		if err != nil {
-			log.Fatalf("Bad xz data in %s: %v", part.Name, err)
+			fmt.Printf("Bad xz data in %s: %v\n", part.Name, err)
+			os.Exit(1)
 		}
-		_, err = io.Copy(part.File, xzr)
-		if err != nil {
-			log.Fatalf("Failed to write xz output for %s op %d: %v", part.Name, op, err)
+		if _, err := io.Copy(part.File, xzr); err != nil {
+			fmt.Printf("Failed to write xz output for %s op %d: %v\n", part.Name, op, err)
+			os.Exit(1)
 		}
 	case InstallOperation_ZERO:
 		for _, ext := range ioop.DstExtents {
 			partSeek = int64(*ext.StartBlock * iops.BlockSize)
-			_, err = part.File.Seek(partSeek, 0)
-			if err != nil {
-				log.Fatalf("Failed to seek to %d in output for %s op %d: %v", partSeek, part.Name, op, err)
+			if _, err := part.File.Seek(partSeek, 0); err != nil {
+				fmt.Printf("Failed to seek to %d in output for %s op %d: %v\n", partSeek, part.Name, op, err)
+				os.Exit(1)
 			}
-			_, err = io.Copy(part.File, bytes.NewReader(make([]byte, *ext.NumBlocks*iops.BlockSize)))
-			if err != nil {
-				log.Fatalf("Failed to write zero output for %s op %d: %v", part.Name, op, err)
+			if _, err := io.Copy(part.File, bytes.NewReader(make([]byte, *ext.NumBlocks*iops.BlockSize))); err != nil {
+				fmt.Printf("Failed to write zero output for %s op %d: %v\n", part.Name, op, err)
+				os.Exit(1)
 			}
 		}
 	default:
-		log.Fatalf("Unsupported operation type %d (%s), please report a bug!", *ioop.Type, InstallOperation_Type_name[int32(*ioop.Type)])
+		fmt.Printf("Unsupported operation type %d (%s), please report a bug!\n", *ioop.Type, InstallOperation_Type_name[int32(*ioop.Type)])
+		os.Exit(1)
 	}
 	part.Unlock()
 
-	iops.Lock()
+	dataLock.Lock()
 	dataLen -= *ioop.DataLength
-	iops.Unlock()
+	dataLock.Unlock()
 }
 
 func contains(ss []string, s string) bool {
