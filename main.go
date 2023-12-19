@@ -3,7 +3,6 @@ package main
 import (
 	"archive/zip"
 	"bytes"
-	"compress/bzip2"
 	"context"
 	"fmt"
 	"io"
@@ -14,10 +13,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dsnet/compress/bzip2"
 	"github.com/golang/protobuf/proto"
 	"github.com/mholt/archiver/v4"
 	crunch "github.com/superwhiskers/crunch/v3"
-	"github.com/xi2/xz"
+	humanize "github.com/dustin/go-humanize"
+	xz "github.com/spencercw/go-xz"
 )
 
 const (
@@ -39,6 +40,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	dataCap = uint64(runtime.NumCPU() * 4096000)
 	fmt.Printf("Up to %dMiB of memory may be used to buffer operations on all cores\n", (runtime.NumCPU() * 4))
 
@@ -93,7 +95,7 @@ func main() {
 	iops := NewInstallOps(buf, blockSize, baseOffset, partitions, extractFiles)
 	for i := 0; i < len(iops.Map); i++ {
 		iop := iops.Map[i]
-		fmt.Printf("> %s = %d bytes (%d ops)\n", iop.Name, iop.Size, iop.Ops)
+		fmt.Printf("> %s = %s (%d ops)\n", iop.Name, humanize.Bytes(iop.Size), iop.Ops)
 	}
 	fmt.Printf("= %d install operations remaining\n", len(iops.Ops))
 	iops.Run()
@@ -149,14 +151,15 @@ func parsePayload(buf *crunch.Buffer) (uint64, []*PartitionUpdate, uint64, error
 	if *manifest.MinorVersion != 0 {
 		return 0, nil, 0, fmt.Errorf("Delta payloads not implemented")
 	}
-	// extract partitions
+	// copy the partitions from the manifest
 	blockSize := uint64(*manifest.BlockSize)
 	partitions := make([]*PartitionUpdate, len(manifest.Partitions))
 	for i := 0; i < len(partitions); i++ {
-		/*partition := *manifest.Partitions[i]
-		partitions[i] = &partition*/
-		partitions[i] = manifest.Partitions[i]
+		partition := *manifest.Partitions[i]
+		partitions[i] = &partition
 	}
+	// garbage collect the manifest
+	manifest = nil
 	return blockSize, partitions, 24 + manifestLen + uint64(metadataSigLen), nil
 }
 
@@ -172,8 +175,8 @@ type InstallOpsPartition struct {
 type InstallOpsStats struct {
 	sync.Mutex //Locks changes to stats to prevent stat confusion
 
-	Active int //Threads remaining
-	Counter int //Next install op to be worked
+	Threads sync.WaitGroup //Threads remaining
+	Counter int            //Next install op to be worked
 }
 
 type InstallOps struct {
@@ -249,30 +252,14 @@ func (iops *InstallOps) Run() {
 	if len(iops.Map) == 0 || len(iops.Ops) == 0 {
 		return
 	}
-	threads := runtime.NumCPU()
-	iops.Stats.Active = threads
-	for i := 0; i < threads; i++ {
-		go iops.runThread()
+	for i := 0; i < len(iops.Order); i++ {
+		iops.Stats.Threads.Add(1)
+		go func(op int) {
+			defer iops.Stats.Threads.Done()
+			iops.writeOp(op)
+		}(i)
 	}
-	for iops.Stats.Active > 0 {
-		time.Sleep(time.Millisecond * 100)
-	}
-}
-
-func (iops *InstallOps) runThread() {
-	for {
-		if iops.Stats.Counter >= len(iops.Ops) {
-			break
-		}
-		iops.Stats.Lock()
-		op := iops.Stats.Counter
-		iops.Stats.Counter++
-		iops.Stats.Unlock()
-		iops.writeOp(op)
-	}
-	iops.Stats.Lock()
-	iops.Stats.Active--
-	iops.Stats.Unlock()
+	iops.Stats.Threads.Wait()
 }
 
 func (iops *InstallOps) getPart(op int) *InstallOpsPartition {
@@ -336,18 +323,18 @@ func (iops *InstallOps) writeOp(opIndex int) {
 			os.Exit(1)
 		}
 	case InstallOperation_REPLACE_BZ:
-		bzr := bzip2.NewReader(bytes.NewReader(data))
+		bzr, err := bzip2.NewReader(bytes.NewReader(data), nil)
+		if err != nil {
+			fmt.Printf("Failed to init bzip2 for %s op %d: %v\n", part.Name, op, err)
+			os.Exit(1)
+		}
 		if _, err := io.Copy(part.File, bzr); err != nil {
 			fmt.Printf("Failed to write bzip2 output for %s op %d: %v\n", part.Name, op, err)
 			os.Exit(1)
 		}
 	case InstallOperation_REPLACE_XZ:
-		xzr, err := xz.NewReader(bytes.NewReader(data), 0)
-		if err != nil {
-			fmt.Printf("Bad xz data in %s: %v\n", part.Name, err)
-			os.Exit(1)
-		}
-		if _, err := io.Copy(part.File, xzr); err != nil {
+		xzr := xz.NewDecompressionReader(bytes.NewReader(data))
+		if _, err := io.Copy(part.File, &xzr); err != nil {
 			fmt.Printf("Failed to write xz output for %s op %d: %v\n", part.Name, op, err)
 			os.Exit(1)
 		}
