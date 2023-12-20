@@ -67,6 +67,9 @@ func main() {
 	}
 	defer func() {
 		if len(tmpPayloads) > 0 {
+			for _, payload := range ps.Payloads {
+				payload.Consumer.Close()
+			}
 			for _, tmpPayload := range tmpPayloads {
 				if err := os.Remove(tmpPayload); err != nil {
 					fmt.Printf("Unable to delete %s: %v\n", tmpPayload, err)
@@ -171,7 +174,7 @@ type Payload struct {
 
 	In        string
 	Extract   []string
-	Consumer  io.ReadSeeker
+	Consumer  io.ReadSeekCloser
 
 	BaseOffset uint64
 	BlockSize  uint64
