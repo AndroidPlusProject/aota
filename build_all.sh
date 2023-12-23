@@ -18,13 +18,9 @@ export GOOS=windows
 echo "Building for ($GOOS/$GOARCH) ..."
 go build -o "aota_$GOOS-$GOARCH.exe" -ldflags "-s -w"
 
-#echo "Installing targets ..."
-#cp aota_* ~/bin/
-
+unset GOARCH
+unset GOOS
 echo "Installing target ..."
 go install -ldflags="-s -w"
-
-echo "Migrating targets to www ..."
-mv aota_* /var/www/files/aota/
 
 echo "- Finished building all targets!"

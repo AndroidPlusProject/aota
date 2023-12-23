@@ -1,3 +1,7 @@
+# Exclude binaries built by build_all.sh
+aota_*
+
+#################################################################################
 
 # Created by https://www.gitignore.io/api/go,linux,macos,windows,intellij+all
 # Edit at https://www.gitignore.io/?templates=go,linux,macos,windows,intellij+all
