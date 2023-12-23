@@ -1,5 +1,7 @@
 # Exclude binaries built by build_all.sh
 aota_*
+# Exclude the most likely binary name for aota
+aota*
 
 #################################################################################
 
