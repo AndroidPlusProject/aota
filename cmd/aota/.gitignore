@@ -1,0 +1,4 @@
+# Ignore the out folder crated by build_all.sh
+out
+# Ignore the most likely binary name for aota
+aota

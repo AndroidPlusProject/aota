@@ -77,7 +77,7 @@ func NewInstallOps(payload *Payload, outDir string) (*InstallOps, error) {
 		outFile := fmt.Sprintf("%s/%s.img", outDir, iop.Name)
 		file, err := os.Create(outFile)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to create %s: %v\n", out, err)
+			return nil, fmt.Errorf("Failed to create %s: %v\n", outFile, err)
 		}
 		iop.File = file
 
