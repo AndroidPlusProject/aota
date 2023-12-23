@@ -8,18 +8,19 @@ A multithreaded Android OTA installer, written in Go.
 
 On Linux, Mac, and pretty much everything else:
 
-`./aota -arg value`
+`./aota -a value` or `./aota --arg value`
 
 On Windows:
 
-`.\aota.exe -arg value`
+`.\aota.exe -a value` or `.\aota.exe --arg value`
 
 ```
--input <required: path to OTA.zip or payload.bin>
--out <optional: path to output folder>
--extract <optional: comma,separated,partition,list>
--cap <optional: memory limit in bytes for buffering install operations, anything above 64MiB is pointless>
--debug <optional: no value, just shows debug logs when used>
+--input <required: path to OTA.zip or payload.bin>
+--out <optional: path to output folder>
+--extract <optional: comma,separated,partition,list>
+--cap <optional: memory limit in bytes for buffering install operations, anything above 64MiB is pointless>
+--jobs <optional: limit or increase the number of Go processes that can spawn>
+--debug <optional: no value, just shows debug logs when used>
 ```
 
 For example, to extract boot, dtbo, and vendor_boot from `raven-ota.zip`:

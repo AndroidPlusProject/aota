@@ -104,6 +104,7 @@ func (is *InstallSession) reserve(i uint64) {
 		is.Usage.Lock()
 		if is.Usage.total + i < is.Usage.limit || is.Usage.total <= 0 {
 			is.Usage.total += i
+			is.Usage.Unlock()
 			return
 		}
 		is.Usage.Unlock()

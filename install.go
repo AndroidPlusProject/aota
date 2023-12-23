@@ -149,12 +149,14 @@ func (iops *InstallOps) writeOp(opIndex int) {
 			fmt.Printf("Failed to init bzip2 for %s op %d: %v\n", iop.Name, op, err)
 			return
 		}
+		defer bzr.Close()
 		if _, err := io.Copy(iop.File, bzr); err != nil {
 			fmt.Printf("Failed to write bzip2 output for %s op %d: %v\n", iop.Name, op, err)
 			return
 		}
 	case InstallOperation_REPLACE_XZ:
 		xzr := xz.NewReader(bytes.NewReader(data))
+		defer xzr.Close()
 		if _, err := io.Copy(iop.File, xzr); err != nil {
 			fmt.Printf("Failed to write xz output for %s op %d: %v\n", iop.Name, op, err)
 			return
@@ -166,7 +168,9 @@ func (iops *InstallOps) writeOp(opIndex int) {
 				fmt.Printf("Failed to seek to %d in output for %s op %d: %v\n", partSeek, iop.Name, op, err)
 				os.Exit(1)
 			}
-			if _, err := io.Copy(iop.File, bytes.NewReader(make([]byte, *ext.NumBlocks*iops.BlockSize))); err != nil {
+			w := bytes.NewBuffer(make([]byte, *ext.NumBlocks*iops.BlockSize))
+			defer w.Reset()
+			if _, err := io.Copy(iop.File, w); err != nil {
 				fmt.Printf("Failed to write zero output for %s op %d: %v\n", iop.Name, op, err)
 				os.Exit(1)
 			}
