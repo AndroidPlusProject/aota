@@ -20,6 +20,7 @@ var (
 	out     = "."
 	extract = make([]string, 0)
 	jobs    = 0
+	stats   = false
 )
 
 func init() {
@@ -41,36 +42,48 @@ func main() {
 	pflag.StringSliceVarP(&extract, "extract", "e", extract, "comma-separated partition list to write (default all, works with multiple payloads)")
 	pflag.Uint64VarP(     &dataCap, "cap",     "c", dataCap, "byte ceiling for buffering install operations")
 	pflag.BoolVarP(       &debug,   "debug",   "d", debug,   "debug mode, everything is log spam")
+	pflag.BoolVarP(       &stats,   "stats",   "s", stats,   "prints payload stats instead of installing")
 	pflag.IntVarP(        &jobs,    "jobs",    "j", jobs,    "limit for how many Go processes can spawn")
 	pflag.Parse()
 
 	runtime.GOMAXPROCS(jobs)
 
-	fmt.Println("Initializing install session...")
-	taskStart := time.Now()
-	is, err := aota.NewInstallSessionMulti(in, extract, out)
-	if err != nil {
-		fmt.Printf("Error initializing installer: %v\n", err)
-		os.Exit(1)
-	}
-	is.SetMemoryLimit(dataCap)
-	is.SetDebug(debug)
-	if debug { fmt.Printf("Task time: %dms\n", time.Now().Sub(taskStart).Milliseconds()) }
-
-	for i := 0; i < len(is.Payloads); i++ {
-		p := is.Payloads[i]
-		fmt.Printf("- %s\n  Partitions: %d\n  Offset: 0x%X\n  Block Size: %d\n", p.In, len(p.Partitions), p.BaseOffset, p.BlockSize)
-		for j := 0; j < len(p.Installer.Map); j++ {
-			iop := p.Installer.Map[j]
-			fmt.Printf("> %s = %s (%d ops)\n", iop.Name, humanize.Bytes(iop.Size), iop.Ops)
+	if stats {
+		for i := 0; i < len(in); i++ {
+			p, err := aota.NewPayloadFile(in[i], extract, false)
+			if err != nil {
+				fmt.Printf("Error loading payload '%s': %v\n", in[i], err)
+				continue
+			}
+			fmt.Println(p)
 		}
-		fmt.Printf("= %d total install operations\n", len(p.Installer.Ops))
-	}
+	} else {
+		fmt.Println("Initializing install session...")
+		taskStart := time.Now()
+		is, err := aota.NewInstallSessionMulti(in, extract, out)
+		if err != nil {
+			fmt.Printf("Error initializing installer: %v\n", err)
+			os.Exit(1)
+		}
+		is.SetMemoryLimit(dataCap)
+		is.SetDebug(debug)
+		if debug { fmt.Printf("Task time: %dms\n", time.Now().Sub(taskStart).Milliseconds()) }
 
-	fmt.Println("Installing...")
-	taskStart = time.Now()
-	is.Install()
-	if debug { fmt.Printf("Task time: %dms\n", time.Now().Sub(taskStart).Milliseconds()) }
+		for i := 0; i < len(is.Payloads); i++ {
+			p := is.Payloads[i]
+			fmt.Printf("- %s\n  Partitions: %d\n  Offset: 0x%X\n  Block Size: %d\n", p.In, len(p.Partitions), p.BaseOffset, p.BlockSize)
+			for j := 0; j < len(p.Installer.Map); j++ {
+				iop := p.Installer.Map[j]
+				fmt.Printf("> %s: %s (%d ops)\n", iop.Name, humanize.Bytes(iop.Size), iop.Ops)
+			}
+			fmt.Printf("= %d total install operations\n", len(p.Installer.Ops))
+		}
+
+		fmt.Println("Installing...")
+		taskStart = time.Now()
+		is.Install()
+		if debug { fmt.Printf("Task time: %dms\n", time.Now().Sub(taskStart).Milliseconds()) }
+	}
 
 	deltaTime := time.Now().Sub(startTime)
 	minutes := int(math.Floor(deltaTime.Minutes()))

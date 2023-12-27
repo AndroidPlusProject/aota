@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/golang/protobuf/proto"
 	crunch "github.com/superwhiskers/crunch/v3"
+	humanize "github.com/dustin/go-humanize"
 )
 
 const (
@@ -23,7 +25,7 @@ type Payload struct {
 	Temporary bool
 	In        string
 	Extract   []string
-	Consumer  io.ReadSeekCloser
+	Consumer  *PayloadConsumer
 
 	BaseOffset uint64
 	BlockSize  uint64
@@ -33,14 +35,36 @@ type Payload struct {
 	InstallSession *InstallSession
 }
 
+func (payload *Payload) String() string {
+	parts := make([]string, 0)
+	size := uint64(0)
+	ops := 0
+	for i := 0; i < len(payload.Partitions); i++ {
+		part := payload.Partitions[i]
+		pSize := uint64(0)
+		for j := 0; j < len(part.Operations); j++ {
+			pSize += *part.Operations[j].DataLength
+		}
+		partStr := fmt.Sprintf("- %s: %s (%d ops)", *part.PartitionName, humanize.Bytes(pSize), len(part.Operations))
+
+		parts = append(parts, partStr)
+		size += pSize
+		ops += len(part.Operations)
+	}
+	return fmt.Sprintf("in:'%s' extract:%v partitions:%d size:'%s' ops:%d offset:%d block:%d\n%s",
+		payload.In, payload.Extract, len(payload.Partitions), humanize.Bytes(size),
+		ops, payload.BaseOffset, payload.BlockSize, strings.Join(parts, "\n"))
+}
+
 func NewPayloadURL(in string, extract []string) (*Payload, error) {
 	return nil, fmt.Errorf("network payloads are not supported yet")
 }
 
-func NewPayloadFile(in string, extract []string) (*Payload, error) {
+func NewPayloadFile(in string, extract []string, extractArchive bool) (*Payload, error) {
 	payload := &Payload{
 		In: in,
 		Extract: extract,
+		Consumer: &PayloadConsumer{},
 	}
 
 	bin, err := os.Open(in)
@@ -56,22 +80,37 @@ func NewPayloadFile(in string, extract []string) (*Payload, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error finding payload inside archive: %v", err)
 		}
-		tmpPayload, err := os.CreateTemp("", "aota_payload-*.bin")
-		if err != nil {
-			return nil, fmt.Errorf("error creating temp payload: %v", err)
+		if extractArchive {
+			tmpPayload, err := os.CreateTemp("", "aota_payload-*.bin")
+			if err != nil {
+				return nil, fmt.Errorf("error creating temp payload: %v", err)
+			}
+			tmpPayloadName := tmpPayload.Name()
+			if _, err := io.Copy(tmpPayload, zrcPayload); err != nil {
+				zrcPayload.Close()
+				tmpPayload.Close()
+				os.Remove(tmpPayloadName)
+				return nil, fmt.Errorf("error extracting temp payload: %v", err)
+			}
+			tmpPayload.Seek(0, 0) //Reset the position since we wrote to it
+
+			//Re-open the archived payload to reset its read position
+			zrcPayload.Close()
+			zrcPayload, err = zrc.Open(payloadFilename)
+			if err != nil {
+				tmpPayload.Close()
+				os.Remove(tmpPayloadName)
+				return nil, fmt.Errorf("error re-opening payload inside archive: %v", err)
+			}
+
+			payload.Consumer.Seekable = tmpPayload
+			payload.In = tmpPayloadName
+			payload.Temporary = true
 		}
-		tmpPayloadName := tmpPayload.Name()
-		if _, err := io.Copy(tmpPayload, zrcPayload); err != nil {
-			tmpPayload.Close()
-			os.Remove(tmpPayloadName)
-			return nil, fmt.Errorf("error extracting temp payload: %v", err)
-		}
-		bin = tmpPayload
-		payload.In = tmpPayloadName
-		payload.Temporary = true
+		payload.Consumer.Readable = zrcPayload
+	} else {
+		payload.Consumer.Seekable = bin
 	}
-	bin.Seek(0, 0) //Reset the seek position
-	payload.Consumer = bin
 	return payload, payload.Parse()
 }
 

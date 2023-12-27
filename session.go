@@ -62,7 +62,7 @@ func (is *InstallSession) AddPayload(in string, extract []string, outDir string)
 			return
 		}
 	} else {
-		payload, err = NewPayloadFile(in, extract)
+		payload, err = NewPayloadFile(in, extract, true)
 		if err != nil {
 			return
 		}
