@@ -26,6 +26,7 @@ type Payload struct {
 	In        string
 	Extract   []string
 	Consumer  *PayloadConsumer
+	Manifest  *DeltaArchiveManifest
 
 	BaseOffset uint64
 	BlockSize  uint64
@@ -65,6 +66,7 @@ func NewPayloadFile(in string, extract []string, extractArchive bool) (*Payload,
 		In: in,
 		Extract: extract,
 		Consumer: &PayloadConsumer{},
+		Manifest: &DeltaArchiveManifest{},
 	}
 
 	bin, err := os.Open(in)
@@ -166,24 +168,23 @@ func (payload *Payload) Parse() error {
 	if _, err := io.ReadFull(payload.Consumer, manifestRaw); err != nil {
 		return fmt.Errorf("error reading payload manifest: %v", err)
 	}
-	manifest := &DeltaArchiveManifest{}
-	if err := proto.Unmarshal(manifestRaw, manifest); err != nil {
+	if err := proto.Unmarshal(manifestRaw, payload.Manifest); err != nil {
 		return fmt.Errorf("error parsing payload protobuf: %v", err)
 	}
-	if *manifest.MinorVersion != 0 {
+	if *payload.Manifest.MinorVersion != 0 {
 		return fmt.Errorf("incremental payloads are not supported yet")
 	}
 
 	payload.BaseOffset = headerSize + manifestLen + uint64(metadataSigLen)
-	payload.BlockSize = uint64(*manifest.BlockSize)
+	payload.BlockSize = uint64(*payload.Manifest.BlockSize)
 	payload.Partitions = make([]*PartitionUpdate, 0)
-	for i := 0; i < len(manifest.Partitions); i++ {
+	for i := 0; i < len(payload.Manifest.Partitions); i++ {
 		if payload.Extract != nil && len(payload.Extract) > 0 {
-			if !contains(payload.Extract, *manifest.Partitions[i].PartitionName) {
+			if !contains(payload.Extract, *payload.Manifest.Partitions[i].PartitionName) {
 				continue
 			}
 		}
-		payload.Partitions = append(payload.Partitions, manifest.Partitions[i])
+		payload.Partitions = append(payload.Partitions, payload.Manifest.Partitions[i])
 	}
 
 	return nil
