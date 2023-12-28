@@ -1,7 +1,8 @@
 #!/bin/bash
 
 mkdir out
-export PREFIX="out/aota_"
+export PREFIX="$PWD/out/aota_"
+pushd cmd/aota
 
 # Linux/amd64
 export GOARCH=amd64
@@ -26,4 +27,5 @@ unset GOOS
 echo "Installing target ..."
 go install -ldflags="-s -w"
 
+popd
 echo "- Finished building all targets!"

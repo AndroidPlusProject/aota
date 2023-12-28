@@ -60,17 +60,17 @@ func NewInstallOps(payload *Payload, outDir string) (*InstallOps, error) {
 		taskStart := time.Now()
 
 		p := payload.Partitions[i]
-		if p.PartitionName == nil {
+		if p.PartitionName == "" {
 			continue
 		}
-		pName := *p.PartitionName
+		pName := p.PartitionName
 
 		iop := &InstallOpsPartition{
 			Name: pName,
 			Ops: len(p.Operations),
 		}
 		for j := 0; j < len(p.Operations); j++ {
-			iop.Size += *p.Operations[j].DataLength
+			iop.Size += p.Operations[j].GetDataLength()
 			iops.Steps = append(iops.Steps, InstallOpStep{Op: j, Iop: iop})
 		}
 
@@ -116,8 +116,8 @@ func (iops *InstallOps) writeOp(opIndex int) {
 	op := step.Op
 	iop := step.Iop
 	ioop := iops.Ops[op]
-	seek := int64(iops.BaseOffset + *ioop.DataOffset)
-	dataLength := *ioop.DataLength
+	seek := int64(iops.BaseOffset + ioop.GetDataOffset())
+	dataLength := ioop.GetDataLength()
 
 	//Reserve enough free memory
 	iops.Payload.InstallSession.reserve(dataLength)
@@ -131,13 +131,13 @@ func (iops *InstallOps) writeOp(opIndex int) {
 
 	//Write the bytes for the operation
 	iop.Lock()
-	partSeek := int64(*ioop.DstExtents[0].StartBlock * iops.BlockSize)
+	partSeek := int64(ioop.DstExtents[0].GetStartBlock() * iops.BlockSize)
 	if _, err := iop.File.Seek(partSeek, 0); err != nil {
 		fmt.Printf("Failed to seek to %d in output for %s op %d: %v\n", partSeek, iop.Name, op, err)
 		return
 	}
 
-	switch *ioop.Type {
+	switch ioop.Type {
 	case InstallOperation_REPLACE:
 		if _, err := iop.File.Write(data); err != nil {
 			fmt.Printf("Failed to write output for %s op %d: %v\n", iop.Name, op, err)
@@ -163,12 +163,12 @@ func (iops *InstallOps) writeOp(opIndex int) {
 		}
 	case InstallOperation_ZERO:
 		for _, ext := range ioop.DstExtents {
-			partSeek = int64(*ext.StartBlock * iops.BlockSize)
+			partSeek = int64(ext.GetStartBlock() * iops.BlockSize)
 			if _, err := iop.File.Seek(partSeek, 0); err != nil {
 				fmt.Printf("Failed to seek to %d in output for %s op %d: %v\n", partSeek, iop.Name, op, err)
 				os.Exit(1)
 			}
-			w := bytes.NewBuffer(make([]byte, *ext.NumBlocks*iops.BlockSize))
+			w := bytes.NewBuffer(make([]byte, ext.GetNumBlocks()*iops.BlockSize))
 			defer w.Reset()
 			if _, err := io.Copy(iop.File, w); err != nil {
 				fmt.Printf("Failed to write zero output for %s op %d: %v\n", iop.Name, op, err)
@@ -176,7 +176,7 @@ func (iops *InstallOps) writeOp(opIndex int) {
 			}
 		}
 	default:
-		fmt.Printf("Unsupported operation type %d (%s), please report a bug!\n", *ioop.Type, InstallOperation_Type_name[int32(*ioop.Type)])
+		fmt.Printf("Unsupported operation type %d (%s), please report a bug!\n", ioop.Type, InstallOperation_Type_name[int32(ioop.Type)])
 		os.Exit(1)
 	}
 	iop.Unlock()

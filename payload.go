@@ -14,9 +14,13 @@ import (
 )
 
 const (
-	brilloMajorPayloadVersion = 2
-	payloadFilename           = "payload.bin"
-	payloadMagic              = "CrAU"
+	brilloMajorPayloadVersion   = 2
+	payloadMagic                = "CrAU"
+	payloadDotBin               = "payload.bin"
+	payloadUnderscoreProperties = "payload_properties.txt"
+	payloadMetaInfMetadata      = "META-INF/com/android/metadata"
+	payloadMetaInfMetadataPb    = "META-INF/com/android/metadata.pb"
+	payloadMetaInfOtaCert       = "META-INF/com/android/otacert"
 )
 
 type Payload struct {
@@ -25,15 +29,17 @@ type Payload struct {
 	Temporary bool
 	In        string
 	Extract   []string
-	Consumer  *PayloadConsumer
 	Manifest  *DeltaArchiveManifest
+	Metadata  *OtaMetadata
 
 	BaseOffset uint64
 	BlockSize  uint64
 	Partitions []*PartitionUpdate
 
-	Installer      *InstallOps
-	InstallSession *InstallSession
+	Consumer         *PayloadConsumer
+	MetadataConsumer io.ReadCloser
+	Installer        *InstallOps
+	InstallSession   *InstallSession
 }
 
 func (payload *Payload) String() string {
@@ -44,15 +50,48 @@ func (payload *Payload) String() string {
 		part := payload.Partitions[i]
 		pSize := uint64(0)
 		for j := 0; j < len(part.Operations); j++ {
-			pSize += *part.Operations[j].DataLength
+			if op := part.Operations[j]; op != nil {
+				pSize += op.GetDataLength()
+			}
 		}
-		partStr := fmt.Sprintf("- %s: %s (%d ops)", *part.PartitionName, humanize.Bytes(pSize), len(part.Operations))
+		partStr := fmt.Sprintf("- %s: %s (%d ops)", part.PartitionName, humanize.Bytes(pSize), len(part.Operations))
 
 		parts = append(parts, partStr)
 		size += pSize
 		ops += len(part.Operations)
 	}
-	return fmt.Sprintf("in:'%s' extract:%v partitions:%d size:'%s' ops:%d offset:%d block:%d\n%s",
+	otaType := "?"
+	cond := "cond:"
+	m := payload.Metadata
+	if m != nil {
+		switch m.Type {
+		case OtaMetadata_UNKNOWN:
+			otaType = "UNKNOWN"
+		case OtaMetadata_AB:
+			otaType = "AB"
+		case OtaMetadata_BLOCK:
+			otaType = "BLOCK"
+		case OtaMetadata_BRICK:
+			otaType = "BRICK"
+		}
+		state := m.Precondition
+		if state == nil {
+			state = m.Postcondition
+		}
+		if state != nil {
+			cond += "true"
+			if len(state.Device) > 0 {
+				cond += " target:'" + state.Device[0] + "'"
+			}
+			if state.BuildIncremental != "" {
+				cond += " incremental:'" + state.BuildIncremental + "'"
+			}
+		} else {
+			cond += "false"
+		}
+	}
+	return fmt.Sprintf("type:'%s'\nwipe:%t\ndowngrade:%t\n%s\nin:'%s'\nextract:%v\npartitions:%d\nsize:'%s'\nops:%d\noffset:%d\nblock:%d\n%s",
+		otaType, m.Wipe, m.Downgrade, cond,
 		payload.In, payload.Extract, len(payload.Partitions), humanize.Bytes(size),
 		ops, payload.BaseOffset, payload.BlockSize, strings.Join(parts, "\n"))
 }
@@ -67,6 +106,7 @@ func NewPayloadFile(in string, extract []string, extractArchive bool) (*Payload,
 		Extract: extract,
 		Consumer: &PayloadConsumer{},
 		Manifest: &DeltaArchiveManifest{},
+		Metadata: &OtaMetadata{},
 	}
 
 	bin, err := os.Open(in)
@@ -78,7 +118,8 @@ func NewPayloadFile(in string, extract []string, extractArchive bool) (*Payload,
 		return nil, fmt.Errorf("error getting stat on payload: %v", err)
 	}
 	if zrc, err := zip.NewReader(bin, stat.Size()); err == nil {
-		zrcPayload, err := zrc.Open(payloadFilename)
+		//Find and open the payload binary
+		zrcPayload, err := zrc.Open(payloadDotBin)
 		if err != nil {
 			return nil, fmt.Errorf("error finding payload inside archive: %v", err)
 		}
@@ -98,7 +139,7 @@ func NewPayloadFile(in string, extract []string, extractArchive bool) (*Payload,
 
 			//Re-open the archived payload to reset its read position
 			zrcPayload.Close()
-			zrcPayload, err = zrc.Open(payloadFilename)
+			zrcPayload, err = zrc.Open(payloadDotBin)
 			if err != nil {
 				tmpPayload.Close()
 				os.Remove(tmpPayloadName)
@@ -110,6 +151,11 @@ func NewPayloadFile(in string, extract []string, extractArchive bool) (*Payload,
 			payload.Temporary = true
 		}
 		payload.Consumer.Readable = zrcPayload
+
+		//Find and store the payload metadata
+		if zrcMetadata, err := zrc.Open(payloadMetaInfMetadataPb); err == nil {
+			payload.MetadataConsumer = zrcMetadata
+		}
 	} else {
 		payload.Consumer.Seekable = bin
 	}
@@ -121,6 +167,7 @@ func (payload *Payload) Close() error {
 	//Wait for all workers to finish before returning from Close()
 
 	//Close out active handles
+	payload.MetadataConsumer.Close()
 	payload.Consumer.Close()
 	if payload.Temporary {
 		if err := os.Remove(payload.In); err != nil {
@@ -138,6 +185,17 @@ func (payload *Payload) Close() error {
 func (payload *Payload) Parse() error {
 	if payload.Consumer == nil {
 		return fmt.Errorf("cannot parse nil consumer")
+	}
+
+	//Parse metadata if available
+	if payload.MetadataConsumer != nil {
+		metadataRaw, err := io.ReadAll(payload.MetadataConsumer)
+		if err != nil {
+			return fmt.Errorf("error reading metadata: %v", err)
+		}
+		if err := proto.Unmarshal(metadataRaw, payload.Metadata); err != nil {
+			return fmt.Errorf("error parsing metadata protobuf: %v", err)
+		}
 	}
 
 	headerSize := uint64(len(payloadMagic) + 8 + 8 + 4) //magic + version(u64) + manifestLen(u64) + metadataSignatureLen(u32)
@@ -171,16 +229,13 @@ func (payload *Payload) Parse() error {
 	if err := proto.Unmarshal(manifestRaw, payload.Manifest); err != nil {
 		return fmt.Errorf("error parsing payload protobuf: %v", err)
 	}
-	if *payload.Manifest.MinorVersion != 0 {
-		return fmt.Errorf("incremental payloads are not supported yet")
-	}
 
 	payload.BaseOffset = headerSize + manifestLen + uint64(metadataSigLen)
-	payload.BlockSize = uint64(*payload.Manifest.BlockSize)
+	payload.BlockSize = uint64(payload.Manifest.GetBlockSize())
 	payload.Partitions = make([]*PartitionUpdate, 0)
 	for i := 0; i < len(payload.Manifest.Partitions); i++ {
 		if payload.Extract != nil && len(payload.Extract) > 0 {
-			if !contains(payload.Extract, *payload.Manifest.Partitions[i].PartitionName) {
+			if !contains(payload.Extract, payload.Manifest.Partitions[i].PartitionName) {
 				continue
 			}
 		}
