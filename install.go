@@ -111,6 +111,13 @@ func (iops *InstallOps) Run() {
 	iops.running = false
 }
 
+func (iops *InstallOps) checkDelta(required uint32, opType InstallOperation_Type) {
+	if delta := iops.Payload.Manifest.GetMinorVersion(); delta > 0 && delta < required {
+		fmt.Printf("Unexpected op type %s on delta %d, expected %d\n", opType, delta, required)
+		os.Exit(1)
+	}
+}
+
 func (iops *InstallOps) writeOp(opIndex int) {
 	step := iops.Steps[opIndex]
 	op := step.Op
@@ -126,42 +133,25 @@ func (iops *InstallOps) writeOp(opIndex int) {
 	data, err := iops.Payload.ReadBytes(seek, int64(dataLength))
 	if err != nil {
 		fmt.Printf("Failed to read %d bytes from offset %d in payload for %s op %d: %v\n", dataLength, seek, iop.Name, op, err)
+		os.Exit(1)
 		return
 	}
 
 	//Write the bytes for the operation
 	iop.Lock()
+	defer iop.Unlock()
 	partSeek := int64(ioop.DstExtents[0].GetStartBlock() * iops.BlockSize)
 	if _, err := iop.File.Seek(partSeek, 0); err != nil {
 		fmt.Printf("Failed to seek to %d in output for %s op %d: %v\n", partSeek, iop.Name, op, err)
+		os.Exit(1)
 		return
 	}
 
 	switch ioop.Type {
-	case InstallOperation_REPLACE:
-		if _, err := iop.File.Write(data); err != nil {
-			fmt.Printf("Failed to write output for %s op %d: %v\n", iop.Name, op, err)
-			return
-		}
-	case InstallOperation_REPLACE_BZ:
-		bzr, err := bzip2.NewReader(bytes.NewReader(data), nil)
-		if err != nil {
-			fmt.Printf("Failed to init bzip2 for %s op %d: %v\n", iop.Name, op, err)
-			return
-		}
-		defer bzr.Close()
-		if _, err := io.Copy(iop.File, bzr); err != nil {
-			fmt.Printf("Failed to write bzip2 output for %s op %d: %v\n", iop.Name, op, err)
-			return
-		}
-	case InstallOperation_REPLACE_XZ:
-		xzr := xz.NewReader(bytes.NewReader(data))
-		defer xzr.Close()
-		if _, err := io.Copy(iop.File, xzr); err != nil {
-			fmt.Printf("Failed to write xz output for %s op %d: %v\n", iop.Name, op, err)
-			return
-		}
-	case InstallOperation_ZERO:
+
+	// Write zeros in the destination.
+	case InstallOperation_ZERO: //delta >= 4
+		iops.checkDelta(4, ioop.Type)
 		for _, ext := range ioop.DstExtents {
 			partSeek = int64(ext.GetStartBlock() * iops.BlockSize)
 			if _, err := iop.File.Seek(partSeek, 0); err != nil {
@@ -175,11 +165,99 @@ func (iops *InstallOps) writeOp(opIndex int) {
 				os.Exit(1)
 			}
 		}
+
+	// Discard the destination blocks, reading as undefined.
+	case InstallOperation_DISCARD: //delta >= 4
+		iops.checkDelta(4, ioop.Type)
+		fmt.Println("TODO: DISCARD")
+
+	// Deprecated: Move source extents to target extents.
+	case InstallOperation_MOVE: //delta >= 1
+		iops.checkDelta(1, ioop.Type)
+		fmt.Println("TODO: MOVE")
+
+	// Copy from source to target partition.
+	case InstallOperation_SOURCE_COPY: //delta >= 2
+		iops.checkDelta(2, ioop.Type)
+		//A/B devices need to copy from source to target slot
+		//For now, act like an A-only device and update in-place to the target images
+		return
+
+	// Replace destination extents w/ attached data.
+	case InstallOperation_REPLACE: //delta >= 1
+		iops.checkDelta(1, ioop.Type)
+		if _, err := iop.File.Write(data); err != nil {
+			fmt.Printf("Failed to write output for %s op %d: %v\n", iop.Name, op, err)
+			os.Exit(1)
+			return
+		}
+
+	// Replace destination extents w/ attached bzipped data.
+	case InstallOperation_REPLACE_BZ: //delta >= 1
+		iops.checkDelta(1, ioop.Type)
+		bzr, err := bzip2.NewReader(bytes.NewReader(data), nil)
+		if err != nil {
+			fmt.Printf("Failed to init bzip2 for %s op %d: %v\n", iop.Name, op, err)
+			os.Exit(1)
+			return
+		}
+		defer bzr.Close()
+		if _, err := io.Copy(iop.File, bzr); err != nil {
+			fmt.Printf("Failed to write bzip2 output for %s op %d: %v\n", iop.Name, op, err)
+			os.Exit(1)
+			return
+		}
+
+	// Replace destination extents w/ attached xz data.
+	case InstallOperation_REPLACE_XZ: //delta >= 3
+		iops.checkDelta(3, ioop.Type)
+		xzr := xz.NewReader(bytes.NewReader(data))
+		defer xzr.Close()
+		if _, err := io.Copy(iop.File, xzr); err != nil {
+			fmt.Printf("Failed to write xz output for %s op %d: %v\n", iop.Name, op, err)
+			os.Exit(1)
+			return
+		}
+
+	// Deprecated: The data is a bsdiff binary diff.
+	case InstallOperation_BSDIFF: //delta >= 1
+		iops.checkDelta(1, ioop.Type)
+		fmt.Println("TODO: BSDIFF")
+
+	// Like BSDIFF, but read from source partition.
+	case InstallOperation_SOURCE_BSDIFF: //delta >= 2
+		iops.checkDelta(2, ioop.Type)
+		fmt.Println("TODO: SOURCE BSDIFF")
+
+	// Like SOURCE_BSDIFF, but compressed with brotli.
+	case InstallOperation_BROTLI_BSDIFF: //delta >= 4
+		iops.checkDelta(4, ioop.Type)
+		fmt.Println("TODO: BROTLI BSDIFF")
+
+	// The data is in puffdiff format.
+	case InstallOperation_PUFFDIFF: //delta >= 5
+		iops.checkDelta(5, ioop.Type)
+		fmt.Println("TODO: PUFFDIFF")
+
+	// The data is in zucchini format.
+	case InstallOperation_ZUCCHINI: //delta >= 8
+		iops.checkDelta(8, ioop.Type)
+		fmt.Println("TODO: ZUCCHINI")
+
+	// Like BSDIFF, but compressed with lzma4.
+	case InstallOperation_LZ4DIFF_BSDIFF: //delta >= 9
+		iops.checkDelta(9, ioop.Type)
+		fmt.Println("TODO: LZ4DIFF BSDIFF")
+
+	// Like PUFFDIFF, but compressed with lzma4.
+	case InstallOperation_LZ4DIFF_PUFFDIFF: //delta >= 9
+		iops.checkDelta(9, ioop.Type)
+		fmt.Println("TODO: LZ4DIFF PUFFDIFF")
+
 	default:
-		fmt.Printf("Unsupported operation type %d (%s), please report a bug!\n", ioop.Type, InstallOperation_Type_name[int32(ioop.Type)])
+		fmt.Printf("Unsupported operation type %d (%s), please report a bug!\n", ioop.Type, ioop.Type)
 		os.Exit(1)
 	}
-	iop.Unlock()
 
 	//Free the reserved memory
 	iops.Payload.InstallSession.free(dataLength)
