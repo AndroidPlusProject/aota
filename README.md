@@ -2,13 +2,20 @@
 
 A multithreaded Android OTA installer, written in Go.
 
-[Download self-hosted releases from the latest commit](https://files.joshuadoes.com/aota) (stripped using `go build -ldflags="-s -w"`)
+## Installing
+
+- Install Go, setup your $GOBIN directory.
+- Install liblzma-dev (required to prevent usage of older and incompatible C code for xz).
+- Clone this repo and navigate to it using your terminal.
+- `cd cmd/aota`
+- `CGO_CFLAGS=-DGOXZ_SKIP_C_COMPILATION CGO_LDFLAGS=-llzma go install`
+- Start using `$GOBIN/aota`, or add it to your $PATH.
 
 ## Usage
 
 On Linux, Mac, and pretty much everything else:
 
-`./aota -a value` or `./aota --arg value`
+`aota -a value` or `aota --arg value`
 
 On Windows:
 
