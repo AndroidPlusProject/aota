@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	crunch "github.com/superwhiskers/crunch/v3"
 	humanize "github.com/dustin/go-humanize"
 )
@@ -167,8 +167,12 @@ func (payload *Payload) Close() error {
 	//Wait for all workers to finish before returning from Close()
 
 	//Close out active handles
-	payload.MetadataConsumer.Close()
-	payload.Consumer.Close()
+	if payload.MetadataConsumer != nil {
+		payload.MetadataConsumer.Close()
+	}
+	if payload.Consumer != nil {
+		payload.Consumer.Close()
+	}
 	if payload.Temporary {
 		if err := os.Remove(payload.In); err != nil {
 			return err

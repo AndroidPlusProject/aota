@@ -84,11 +84,11 @@ func (is *InstallSession) Install() {
 		return
 	}
 	is.installing = true
+	defer is.Close()
 	for i := 0; i < len(is.Payloads); i++ {
+		defer is.Payloads[i].Close()
 		is.Payloads[i].Installer.Run()
-		is.Payloads[i].Close()
 	}
-	is.Close()
 }
 
 func (is *InstallSession) IsInstalling() bool {
